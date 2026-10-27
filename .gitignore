@@ -1,0 +1,7 @@
+bin/
+obj/
+*.exe
+*.pdb
+config.ini
+debug.log
+.vs/
