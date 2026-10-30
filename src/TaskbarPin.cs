@@ -30,6 +30,8 @@ namespace TaskbarPin
         public static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
         [DllImport("user32.dll")] public static extern IntPtr SetParent(IntPtr hWndChild, IntPtr hWndNewParent);
         [DllImport("user32.dll")] public static extern IntPtr GetParent(IntPtr hWnd);
+        public const uint GA_PARENT = 1;
+        [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr hWnd, uint gaFlags);
         public const uint SWP_NOSIZE = 0x0001;
         public const uint SWP_NOMOVE = 0x0002;
         public const uint SWP_NOACTIVATE = 0x0010;
@@ -106,6 +108,9 @@ namespace TaskbarPin
 
         [DllImport("user32.dll", SetLastError = true)]
         public static extern bool GetWindowRect(IntPtr hwnd, out RECT lpRect);
+
+        [DllImport("user32.dll")]
+        public static extern bool ScreenToClient(IntPtr hWnd, ref POINT lpPoint);
 
         [DllImport("user32.dll")]
         public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
@@ -211,6 +216,21 @@ namespace TaskbarPin
         private int _lastRenderedX = int.MinValue;
         private int _lastRenderedY = int.MinValue;
 
+        // Native icon currently shown in the tray. Bitmap.GetHicon() allocates 1 USER + 3 GDI
+        // handles that only DestroyIcon() frees, so every replaced icon must be destroyed.
+        private IntPtr _trayIconHandle = IntPtr.Zero;
+
+        // Cached Shell_TrayWnd handle; FindWindow at 60 Hz is wasted work.
+        private IntPtr _trayHwnd = IntPtr.Zero;
+
+        // Last known system auto-hide state. SHAppBarMessage is a cross-process round trip
+        // to the shell, so it is probed a few times per second instead of every tick.
+        private bool _cachedAutoHide;
+        private DateTime _lastAutoHideProbeAt = DateTime.MinValue;
+
+        // NotifyIcon raises MouseClick twice for a double click; debounce the toggle.
+        private DateTime _lastTrayClickUtc = DateTime.MinValue;
+
         public PinWidgetForm()
         {
             FormBorderStyle = FormBorderStyle.None;
@@ -253,13 +273,18 @@ namespace TaskbarPin
             {
                 if (e.Button == MouseButtons.Left)
                 {
+                    // A double click arrives as two MouseClick events; without this debounce the
+                    // widget pins and immediately unpins again.
+                    if ((DateTime.UtcNow - _lastTrayClickUtc).TotalMilliseconds < 350) return;
+                    _lastTrayClickUtc = DateTime.UtcNow;
                     TogglePinState();
                 }
             };
 
             // Initialize state: if taskbar is currently NOT auto-hide, treat as pinned
-            bool currentlyAutoHide = GetTaskbarAutoHide();
-            _isPinnedByApp = !currentlyAutoHide;
+            _cachedAutoHide = GetTaskbarAutoHide();
+            _lastAutoHideProbeAt = DateTime.UtcNow;
+            _isPinnedByApp = !_cachedAutoHide;
 
             // Force handle creation immediately even if taskbar starts collapsed
             IntPtr dummyHandle = this.Handle;
@@ -279,27 +304,32 @@ namespace TaskbarPin
                 if (!File.Exists(_configPath)) return;
                 foreach (string rawLine in File.ReadAllLines(_configPath))
                 {
+                    // Tolerate hand-edited files: "OffsetX = -35", "  offsetx=-35", tabs, ...
                     string line = rawLine.Trim();
-                    if (line.StartsWith("OffsetX=", StringComparison.OrdinalIgnoreCase))
+                    int eq = line.IndexOf('=');
+                    if (eq <= 0) continue;
+                    if (!string.Equals(line.Substring(0, eq).Trim(), "OffsetX", StringComparison.OrdinalIgnoreCase)) continue;
+
+                    int val;
+                    if (int.TryParse(line.Substring(eq + 1).Trim(), out val))
                     {
-                        int val;
-                        if (int.TryParse(line.Substring("OffsetX=".Length).Trim(), out val))
-                        {
-                            _offsetFromTrayNotifyLeft = val;
-                        }
+                        _offsetFromTrayNotifyLeft = val;
                     }
                 }
             }
-            catch { }
+            catch (Exception ex) { CrashLog.Write("LoadConfig", ex); }
         }
 
         private void SaveConfig()
         {
             try
             {
-                File.WriteAllText(_configPath, string.Format("OffsetX={0}\r\nPinned={1}\r\n", _offsetFromTrayNotifyLeft, _isPinnedByApp));
+                // Only the offset is persisted. The pin state is not stored on purpose: the taskbar's
+                // own auto-hide flag (ABM_GETSTATE) is the single source of truth, and a stale copy
+                // here would fight it at startup.
+                File.WriteAllText(_configPath, string.Format("OffsetX={0}\r\n", _offsetFromTrayNotifyLeft));
             }
-            catch { }
+            catch (Exception ex) { CrashLog.Write("SaveConfig", ex); }
         }
 
         private bool IsAutoStartEnabled()
@@ -333,7 +363,7 @@ namespace TaskbarPin
                     }
                 }
             }
-            catch { }
+            catch (Exception ex) { CrashLog.Write("Autostart", ex); }
         }
 
         protected override CreateParams CreateParams
@@ -465,11 +495,12 @@ namespace TaskbarPin
             if (_isPinnedByApp)
             {
                 if (this.Visible) this.Hide();
-                SetTaskbarAutoHide(true);
+                ApplyTaskbarAutoHide(true);
                 TriggerNativeTaskbarCollapse(_lastNonTrayForeground, true);
             }
             _trayIcon.Visible = false;
             _trayIcon.Dispose();
+            ReleaseTrayIconHandle();
             Application.Exit();
         }
 
@@ -487,7 +518,7 @@ namespace TaskbarPin
                 _waitingForCollapse = false;
                 _collapseStage = 0;
                 // Pin taskbar: disable auto-hide (ABS_ALWAYSONTOP)
-                SetTaskbarAutoHide(false);
+                ApplyTaskbarAutoHide(false);
                 UpdateVisualState();
                 UpdateWidgetPositionAndVisibility(true);
             }
@@ -504,7 +535,7 @@ namespace TaskbarPin
                 this.Capture = false;
                 SetMouseThrough(true);
 
-                SetTaskbarAutoHide(true);
+                ApplyTaskbarAutoHide(true);
                 IntPtr fallbackFg = _lastNonTrayForeground;
                 this.BeginInvoke((MethodInvoker)delegate
                 {
@@ -604,7 +635,7 @@ namespace TaskbarPin
 
         private void PollTimer_Tick(object sender, EventArgs e)
         {
-            IntPtr tray = Win32.FindWindow("Shell_TrayWnd", null);
+            IntPtr tray = TrayHwnd();
             if (tray != IntPtr.Zero)
             {
                 IntPtr fg = Win32.GetForegroundWindow();
@@ -614,7 +645,16 @@ namespace TaskbarPin
                 }
             }
 
-            bool systemAutoHide = GetTaskbarAutoHide();
+            // SHAppBarMessage(ABM_GETSTATE) is a cross-process round trip to the shell. At 60 Hz
+            // that was the biggest single cost of an idle instance, for a value that only changes
+            // when the user edits taskbar settings, so it is probed twice per second.
+            bool systemAutoHide = _cachedAutoHide;
+            if ((DateTime.UtcNow - _lastAutoHideProbeAt).TotalMilliseconds >= 500)
+            {
+                systemAutoHide = GetTaskbarAutoHide();
+                _cachedAutoHide = systemAutoHide;
+                _lastAutoHideProbeAt = DateTime.UtcNow;
+            }
             double msSinceUnpin = (DateTime.UtcNow - _unpinRequestedAt).TotalMilliseconds;
 
             // Sync state if user changed taskbar auto-hide in Windows Settings
@@ -630,6 +670,15 @@ namespace TaskbarPin
             }
 
             UpdateWidgetPositionAndVisibility(false);
+
+            // Only the collapse/drag animation needs 60 Hz. While nothing is moving a slower tick
+            // keeps the widget glued to the taskbar (it is a child window, so it already follows
+            // the taskbar's own motion) at a fraction of the CPU cost.
+            int desiredInterval = (_waitingForCollapse || _isDragging) ? 16 : 50;
+            if (_pollTimer.Interval != desiredInterval)
+            {
+                _pollTimer.Interval = desiredInterval;
+            }
         }
 
         private void SetMouseThrough(bool enable)
@@ -645,14 +694,27 @@ namespace TaskbarPin
             Win32.SetWindowLong(this.Handle, Win32.GWL_EXSTYLE, exStyle);
         }
 
+        private IntPtr TrayHwnd()
+        {
+            // Cache the handle: FindWindow() on every 16 ms tick is wasted work. IsWindow() keeps
+            // this correct across an Explorer restart, and is far cheaper than a by-class search.
+            if (_trayHwnd != IntPtr.Zero && Win32.IsWindow(_trayHwnd)) return _trayHwnd;
+            _trayHwnd = Win32.FindWindow("Shell_TrayWnd", null);
+            return _trayHwnd;
+        }
+
         private void UpdateWidgetPositionAndVisibility(bool forceTopMost)
         {
-            IntPtr tray = Win32.FindWindow("Shell_TrayWnd", null);
+            IntPtr tray = TrayHwnd();
             if (tray == IntPtr.Zero) return;
 
             // Parent the widget into the taskbar so it shares the taskbar's z-order:
             // covered by fullscreen apps exactly when the taskbar is covered, and slides with it.
-            if (IsHandleCreated && Win32.GetParent(this.Handle) != tray)
+            //
+            // GetParent() is wrong here: the widget has no WS_CHILD style, so GetParent reports its
+            // OWNER (always 0) and the comparison never matched. That made this call SetParent() on
+            // every 16 ms tick, which relinks z-order/DWM state and was the top idle cost.
+            if (IsHandleCreated && Win32.GetAncestor(this.Handle, Win32.GA_PARENT) != tray)
             {
                 Win32.SetParent(this.Handle, tray);
             }
@@ -724,19 +786,39 @@ namespace TaskbarPin
             // Widget is mouse-through while unpinned/collapsing, interactive when pinned.
             SetMouseThrough(!_isPinnedByApp);
 
-            bool posChanged = (_lastRenderedX != targetX || _lastRenderedY != targetY);
+            // The widget lives inside Shell_TrayWnd as a child window, and a child's Location is
+            // interpreted in the PARENT's client space, not on screen. Feeding it the screen-space
+            // target offset it a second time by the taskbar rect, which on a bottom taskbar meant
+            // the pin was rendered entirely off-screen (measured: y = 2049 on a 1600 px display).
+            Point clientPos = ScreenToParentClient(targetX, targetY, tray);
+
+            bool posChanged = (_lastRenderedX != clientPos.X || _lastRenderedY != clientPos.Y);
 
             if (!this.Visible)
             {
-                this.Location = new Point(targetX, targetY);
+                this.Location = clientPos;
                 this.Show();
                 forceTopMost = true;
             }
 
             if (forceTopMost || posChanged)
             {
-                RenderLayeredBitmap(targetX, targetY);
+                RenderLayeredBitmap(clientPos.X, clientPos.Y);
             }
+        }
+
+        private static Point ScreenToParentClient(int screenX, int screenY, IntPtr parent)
+        {
+            Win32.POINT pt = new Win32.POINT();
+            pt.x = screenX;
+            pt.y = screenY;
+            if (!Win32.ScreenToClient(parent, ref pt))
+            {
+                // The parent can disappear mid-tick (Explorer restart); fall back to the raw value
+                // so the next tick, with a fresh handle, can place the widget correctly.
+                return new Point(screenX, screenY);
+            }
+            return new Point(pt.x, pt.y);
         }
 
         public static bool GetTaskbarAutoHide()
@@ -755,6 +837,14 @@ namespace TaskbarPin
             abd.hWnd = Win32.FindWindow("Shell_TrayWnd", null);
             abd.lParam = (IntPtr)(enableAutoHide ? Win32.ABS_AUTOHIDE : Win32.ABS_ALWAYSONTOP);
             Win32.SHAppBarMessage(Win32.ABM_SETSTATE, ref abd);
+        }
+
+        private void ApplyTaskbarAutoHide(bool enableAutoHide)
+        {
+            SetTaskbarAutoHide(enableAutoHide);
+            // Keep the cached copy in sync so the next poll does not undo a change we just made.
+            _cachedAutoHide = enableAutoHide;
+            _lastAutoHideProbeAt = DateTime.UtcNow;
         }
 
         private void UpdateVisualState()
@@ -788,19 +878,75 @@ namespace TaskbarPin
                 {
                     DrawPinBadge(g, 32, _isPinnedByApp, false);
                 }
+
+                // Icon.FromHandle() wraps an HICON without taking ownership, so disposing the Icon
+                // does not free the native handle: that used to leak 1 USER + 3 GDI handles per
+                // call (~3300 status refreshes would exhaust the 10000 GDI handle limit). Keep the
+                // HICON and DestroyIcon() the one we replace.
+                Icon previousIcon = _trayIcon.Icon;
+                IntPtr previousHandle = _trayIconHandle;
+
                 IntPtr hIcon = bmp.GetHicon();
-                Icon oldIcon = _trayIcon.Icon;
                 _trayIcon.Icon = Icon.FromHandle(hIcon);
-                if (oldIcon != null)
+                _trayIconHandle = hIcon;
+
+                if (previousIcon != null)
                 {
-                    oldIcon.Dispose();
+                    previousIcon.Dispose();
+                }
+                if (previousHandle != IntPtr.Zero)
+                {
+                    Win32.DestroyIcon(previousHandle);
                 }
             }
         }
 
+        private void ReleaseTrayIconHandle()
+        {
+            IntPtr handle = _trayIconHandle;
+            _trayIconHandle = IntPtr.Zero;
+            if (handle != IntPtr.Zero)
+            {
+                Win32.DestroyIcon(handle);
+            }
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                if (_pollTimer != null)
+                {
+                    _pollTimer.Stop();
+                    _pollTimer.Dispose();
+                }
+                if (_trayIcon != null)
+                {
+                    _trayIcon.Visible = false;
+                    _trayIcon.Dispose();
+                }
+                if (_contextMenu != null) _contextMenu.Dispose();
+                if (_toolTip != null) _toolTip.Dispose();
+                ReleaseTrayIconHandle();
+            }
+            base.Dispose(disposing);
+        }
+
         private void RenderLayeredBitmap()
         {
-            RenderLayeredBitmap(Left, Top);
+            // Re-blit in place (hover state changed). Left/Top must NOT be used here: the widget is
+            // re-parented into the taskbar but still carries popup styles, so Form.Left reports the
+            // requested screen position while the layered blit uses parent-client coordinates -
+            // mixing them threw the pin one taskbar height off screen. _lastRendered* already holds
+            // the client-space origin of the last successful blit.
+            if (_lastRenderedX == int.MinValue || _lastRenderedY == int.MinValue)
+            {
+                RenderLayeredBitmap(Left, Top);
+            }
+            else
+            {
+                RenderLayeredBitmap(_lastRenderedX, _lastRenderedY);
+            }
         }
 
         private void RenderLayeredBitmap(int renderX, int renderY)
@@ -976,6 +1122,18 @@ namespace TaskbarPin
         {
             Win32.SetProcessDPIAware();
 
+            // winexe has no console, so an unhandled exception used to make the widget vanish
+            // silently. Route both handlers to debug.log (.gitignore already excludes it).
+            AppDomain.CurrentDomain.UnhandledException += delegate(object s, UnhandledExceptionEventArgs e)
+            {
+                CrashLog.Write("AppDomain", e.ExceptionObject as Exception);
+            };
+            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+            Application.ThreadException += delegate(object s, System.Threading.ThreadExceptionEventArgs e)
+            {
+                CrashLog.Write("UI thread", e.Exception);
+            };
+
             if (args.Length > 0)
             {
                 string cmd = args[0].ToLowerInvariant();
@@ -1002,6 +1160,38 @@ namespace TaskbarPin
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             Application.Run(new PinWidgetForm());
+        }
+    }
+
+    /// <summary>
+    /// Minimal crash/diagnostic log. The app is a winexe, so anything swallowed by an empty
+    /// catch block used to disappear without a trace.
+    /// </summary>
+    static class CrashLog
+    {
+        private static readonly object Gate = new object();
+
+        private static string LogPath()
+        {
+            return System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "debug.log");
+        }
+
+        public static void Write(string context, Exception ex)
+        {
+            try
+            {
+                string line = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + " [" + context + "] "
+                    + (ex == null ? "(no exception object)" : ex.ToString())
+                    + Environment.NewLine;
+                lock (Gate)
+                {
+                    System.IO.File.AppendAllText(LogPath(), line);
+                }
+            }
+            catch
+            {
+                // Logging must never take the app down.
+            }
         }
     }
 }
