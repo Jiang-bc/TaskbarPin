@@ -34,6 +34,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1 -SkipAssets   # �
 
 ## 图标与界面
 
+<img src="assets/TaskbarPin.png" width="64" alt="TaskbarPin 图标">
+
+| 浅色 · 自动隐藏 | 深色 · 已钉住 |
+| --- | --- |
+| ![浅色菜单](docs/images/menu-light.png) | ![深色菜单](docs/images/menu-dark.png) |
+
+菜单支持方向键、Enter 和 Esc；菜单打开后可用 P 切换钉住、R 重置位置、S 切换开机启动、X 退出。
+
 - `assets/TaskbarPin.ico`（16–256px，9 档，32 位 ARGB）与 `assets/TaskbarPin.png` 由 `tools/IconAssetBuilder.cs` 用与运行时托盘/任务栏徽标相同的矢量几何绘制，不是位图缩放；`build.ps1` 会重新生成。
 - 右键菜单：顶部为状态行（已钉住 / 自动隐藏），统一图标列，菜单字体与间距遵循系统菜单字体和 DPI。
 - 主题：任务栏徽标跟随“系统（任务栏）”主题，菜单跟随“应用”主题，二者独立读取；高对比度模式改用系统颜色，并保留图标形状区分状态。

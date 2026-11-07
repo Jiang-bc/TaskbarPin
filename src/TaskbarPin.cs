@@ -370,8 +370,10 @@ namespace TaskbarPin
         }
         protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e)
         {
-            e.TextColor = e.Item.Enabled ? _palette.Foreground : _palette.Muted;
-            base.OnRenderItemText(e);
+            // The base renderer substitutes SystemColors.GrayText for disabled items.
+            // Paint the status row with our accessible palette instead.
+            Color color = e.Item.Enabled ? _palette.Foreground : _palette.Muted;
+            TextRenderer.DrawText(e.Graphics, e.Text, e.TextFont, e.TextRectangle, color, e.TextFormat);
         }
         protected override void OnRenderSeparator(ToolStripSeparatorRenderEventArgs e)
         {
@@ -481,18 +483,18 @@ namespace TaskbarPin
             _contextMenu.ImageScalingSize = new Size(Scale(18), Scale(18));
             _contextMenu.Padding = new Padding(Scale(4), Scale(6), Scale(4), Scale(6));
             _menuStatus = new ToolStripMenuItem { Enabled = false, AccessibleRole = AccessibleRole.StaticText };
-            _menuTogglePin = new ToolStripMenuItem("钉住任务栏", null, OnMenuTogglePin) { Tag = "pin" };
-            _menuResetPos = new ToolStripMenuItem("重置图标位置", null, (s, e) =>
+            _menuTogglePin = new ToolStripMenuItem("钉住任务栏(&P)", null, OnMenuTogglePin) { Tag = "pin" };
+            _menuResetPos = new ToolStripMenuItem("重置图标位置(&R)", null, (s, e) =>
             {
                 _offsetFromTrayNotifyLeft = -48;
                 SaveConfig();
                 UpdateWidgetPositionAndVisibility(true);
             }) { Tag = "reset" };
-            _menuAutoStart = new ToolStripMenuItem("开机启动", null, OnMenuAutoStart)
+            _menuAutoStart = new ToolStripMenuItem("开机启动(&S)", null, OnMenuAutoStart)
             {
                 Checked = IsAutoStartEnabled(), Tag = "start"
             };
-            _menuExit = new ToolStripMenuItem("退出并恢复自动隐藏", null, OnMenuExit) { Tag = "exit" };
+            _menuExit = new ToolStripMenuItem("退出并恢复自动隐藏(&X)", null, OnMenuExit) { Tag = "exit" };
 
             _contextMenu.Items.Add(_menuStatus);
             _contextMenu.Items.Add(new ToolStripSeparator());
@@ -1138,13 +1140,13 @@ namespace TaskbarPin
         {
             string tip = _isPinnedByApp
                 ? "任务栏已钉住 · 保持显示\n单击：恢复自动隐藏\n拖动：调整图标位置"
-                : "任务栏自动隐藏\n单击：钉住任务栏\n拖动：调整图标位置";
+                : "任务栏自动隐藏\n单击系统托盘中的图钉：钉住任务栏";
 
             if (_toolTip != null) _toolTip.SetToolTip(this, tip);
             _menuStatus.Text = _isPinnedByApp ? "已钉住 · 任务栏保持显示" : "自动隐藏 · 随系统收起";
             _menuTogglePin.Checked = _isPinnedByApp;
-            _menuTogglePin.Text = _isPinnedByApp ? "恢复自动隐藏" : "钉住任务栏";
-            _menuAutoStart.Text = _menuAutoStart.Checked ? "开机启动（已开启）" : "开机启动";
+            _menuTogglePin.Text = _isPinnedByApp ? "恢复自动隐藏(&P)" : "钉住任务栏(&P)";
+            _menuAutoStart.Text = _menuAutoStart.Checked ? "开机启动（已开启）(&S)" : "开机启动(&S)";
             UpdateMenuImages();
 
             _trayIcon.Text = _isPinnedByApp ? "任务栏钉子：已钉住 (点击释放)" : "任务栏钉子：自动隐藏中 (点击钉住)";
