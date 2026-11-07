@@ -18,11 +18,35 @@
 
 ## 编译
 
-无需任何第三方依赖，直接用系统自带的 csc：
+无需任何第三方依赖，直接用系统自带的 csc。推荐使用构建脚本，它会重新生成图标资源并把图标嵌入 EXE（资源管理器、快捷方式、Alt-Tab 才会显示图标）：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1          # 输出 bin\TaskbarPin.exe
+powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1 -Output C:\path\TaskbarPin.exe
+powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1 -SkipAssets   # 使用已有 assets\TaskbarPin.ico
+```
+
+仍然支持原来的单文件编译（得到的 EXE 功能相同，但没有嵌入图标）：
 
 ```bat
 %WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe /nologo /optimize+ /target:winexe /out:TaskbarPin.exe src\TaskbarPin.cs
 ```
+
+## 图标与界面
+
+- `assets/TaskbarPin.ico`（16–256px，9 档，32 位 ARGB）与 `assets/TaskbarPin.png` 由 `tools/IconAssetBuilder.cs` 用与运行时托盘/任务栏徽标相同的矢量几何绘制，不是位图缩放；`build.ps1` 会重新生成。
+- 右键菜单：顶部为状态行（已钉住 / 自动隐藏），统一图标列，菜单字体与间距遵循系统菜单字体和 DPI。
+- 主题：任务栏徽标跟随“系统（任务栏）”主题，菜单跟随“应用”主题，二者独立读取；高对比度模式改用系统颜色，并保留图标形状区分状态。
+- 检查界面：`tests\Render.cs` 把真实菜单与全部图标尺寸渲染为 PNG（浅色/深色/高对比度），渲染时注入调色板，不修改任何系统设置。
+
+## 测试
+
+```bat
+csc /nologo /optimize+ /r:System.Windows.Forms.dll /r:System.Drawing.dll /out:UiTests.exe tests\UiTests.cs
+UiTests.exe bin\TaskbarPin.exe
+```
+
+`tests\Tests.cs`（反射回归测试）与 `tests\UiTests.cs`（图标资源、菜单布局、对比度、句柄泄漏）均不写注册表，也不改变系统主题；涉及任务栏自动隐藏的用例会在结束时恢复原状态。
 
 ## 使用
 

@@ -185,6 +185,222 @@ namespace TaskbarPin
         public static extern bool DestroyIcon(IntPtr handle);
     }
 
+    // Taskbar and application themes can differ. No registry handles or global event subscriptions
+    // are retained: Windows theme/settings messages and menu opening refresh the palettes.
+    sealed class UiPalette
+    {
+        public Color Background, Foreground, Muted, Border, Selection, Badge, BadgeText;
+        public bool HighContrast;
+
+        public static UiPalette Create(bool light, bool highContrast)
+        {
+            if (highContrast)
+                return new UiPalette { HighContrast = true, Background = SystemColors.Menu,
+                    Foreground = SystemColors.MenuText, Muted = SystemColors.MenuText,
+                    Border = SystemColors.WindowText, Selection = SystemColors.Highlight,
+                    Badge = SystemColors.Window, BadgeText = SystemColors.WindowText };
+            return light
+                ? new UiPalette { Background = Color.FromArgb(250, 250, 250), Foreground = Color.FromArgb(30, 33, 38),
+                    Muted = Color.FromArgb(89, 96, 107), Border = Color.FromArgb(215, 219, 225),
+                    Selection = Color.FromArgb(232, 237, 244), Badge = Color.FromArgb(242, 245, 249), BadgeText = Color.FromArgb(62, 76, 96) }
+                : new UiPalette { Background = Color.FromArgb(37, 39, 43), Foreground = Color.FromArgb(245, 246, 248),
+                    Muted = Color.FromArgb(183, 190, 202), Border = Color.FromArgb(76, 81, 90),
+                    Selection = Color.FromArgb(58, 63, 72), Badge = Color.FromArgb(47, 53, 63), BadgeText = Color.FromArgb(231, 236, 244) };
+        }
+
+        public static UiPalette Read(bool taskbar)
+        {
+            bool light = true;
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"))
+                {
+                    object value = key == null ? null : key.GetValue(taskbar ? "SystemUsesLightTheme" : "AppsUseLightTheme");
+                    if (value is int) light = (int)value != 0;
+                }
+            }
+            catch (System.Security.SecurityException) { }
+            catch (UnauthorizedAccessException) { }
+            return Create(light, SystemInformation.HighContrast);
+        }
+    }
+
+    // Shared vector source for the Windows asset, widget, tray and menu pin, on a 32px grid.
+    // Small sizes receive a slightly broader head and needle for optical clarity.
+    static class PinArtwork
+    {
+        public static GraphicsPath RoundedRect(RectangleF r, float radius)
+        {
+            float d = radius * 2;
+            GraphicsPath path = new GraphicsPath();
+            path.AddArc(r.Left, r.Top, d, d, 180, 90);
+            path.AddArc(r.Right - d, r.Top, d, d, 270, 90);
+            path.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+            path.AddArc(r.Left, r.Bottom - d, d, d, 90, 90);
+            path.CloseFigure();
+            return path;
+        }
+
+        public static void DrawBadge(Graphics g, int size, bool pinned, bool hovered, UiPalette palette)
+        {
+            GraphicsState state = g.Save();
+            try
+            {
+                g.Clear(Color.Transparent);
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                float scale = size / 32f;
+                g.ScaleTransform(scale, scale);
+                Color fill = pinned ? (palette.HighContrast ? SystemColors.Highlight : Color.FromArgb(29, 96, 188)) : palette.Badge;
+                Color ink = pinned ? (palette.HighContrast ? SystemColors.HighlightText : Color.White) : palette.BadgeText;
+                Color border = palette.HighContrast ? ink : (pinned ? Color.FromArgb(22, 77, 155) : palette.Border);
+                if (hovered)
+                {
+                    if (palette.HighContrast) { fill = SystemColors.Highlight; ink = SystemColors.HighlightText; border = ink; }
+                    else fill = pinned ? Color.FromArgb(45, 116, 210) : palette.Selection;
+                }
+                float pad = size <= 20 ? 1.5f : 2f;
+                using (GraphicsPath badge = RoundedRect(new RectangleF(pad, pad, 32 - pad * 2, 32 - pad * 2), 7f))
+                using (Brush brush = new SolidBrush(fill))
+                using (Pen pen = new Pen(border, 1f / scale))
+                {
+                    g.FillPath(brush, badge);
+                    g.DrawPath(pen, badge);
+                }
+                DrawPin(g, ink, pinned, size <= 20);
+            }
+            finally { g.Restore(state); }
+        }
+
+        private static void DrawPin(Graphics g, Color color, bool upright, bool small)
+        {
+            GraphicsState state = g.Save();
+            try
+            {
+                if (!upright) { g.TranslateTransform(16, 16); g.RotateTransform(38); g.TranslateTransform(-16, -16); }
+                float left = small ? 11 : 11.5f, right = 32 - left;
+                using (Brush brush = new SolidBrush(color))
+                using (GraphicsPath body = new GraphicsPath())
+                using (Pen needle = new Pen(color, small ? 2.1f : 1.8f))
+                {
+                    body.AddPolygon(new PointF[] { new PointF(left, 7), new PointF(right, 7),
+                        new PointF(right, 10), new PointF(19, 10), new PointF(19, 14.5f),
+                        new PointF(22, 18.5f), new PointF(22, 20), new PointF(10, 20),
+                        new PointF(10, 18.5f), new PointF(13, 14.5f), new PointF(13, 10), new PointF(left, 10) });
+                    g.FillPath(brush, body);
+                    needle.StartCap = LineCap.Flat; needle.EndCap = LineCap.Round;
+                    g.DrawLine(needle, 16, 19, 16, 25);
+                }
+            }
+            finally { g.Restore(state); }
+        }
+
+        public static Bitmap MenuGlyph(string kind, int size, Color color, bool active)
+        {
+            Bitmap bmp = new Bitmap(size, size, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+            try
+            {
+                using (Graphics g = Graphics.FromImage(bmp))
+                using (Pen pen = new Pen(color, 1.8f))
+                {
+                    g.SmoothingMode = SmoothingMode.AntiAlias;
+                    g.ScaleTransform(size / 24f, size / 24f);
+                    pen.StartCap = pen.EndCap = LineCap.Round;
+                    pen.LineJoin = LineJoin.Round;
+                    if (kind == "pin")
+                    {
+                        g.ScaleTransform(.75f, .75f);
+                        DrawPin(g, color, active, false);
+                    }
+                    else if (kind == "reset")
+                    {
+                        g.DrawArc(pen, 5, 5, 14, 14, -70, 290);
+                        g.DrawLines(pen, new PointF[] { new PointF(4, 9), new PointF(4, 4), new PointF(9, 4) });
+                    }
+                    else if (kind == "start")
+                    {
+                        if (active) g.DrawLines(pen, new PointF[] { new PointF(5, 12), new PointF(10, 17), new PointF(19, 7) });
+                        else { g.DrawArc(pen, 5, 5, 14, 14, -50, 280); g.DrawLine(pen, 12, 3, 12, 11); }
+                    }
+                    else if (kind == "exit")
+                    {
+                        g.DrawLines(pen, new PointF[] { new PointF(10, 4), new PointF(5, 4), new PointF(5, 20), new PointF(10, 20) });
+                        g.DrawLine(pen, 10, 12, 21, 12);
+                        g.DrawLines(pen, new PointF[] { new PointF(17, 8), new PointF(21, 12), new PointF(17, 16) });
+                    }
+                }
+                return bmp;
+            }
+            catch { bmp.Dispose(); throw; }
+        }
+    }
+
+    sealed class PinMenuRenderer : ToolStripProfessionalRenderer
+    {
+        private readonly UiPalette _palette;
+        public PinMenuRenderer(UiPalette palette) { _palette = palette; RoundedEdges = false; }
+        protected override void OnRenderToolStripBackground(ToolStripRenderEventArgs e)
+        {
+            using (Brush b = new SolidBrush(_palette.Background)) e.Graphics.FillRectangle(b, e.AffectedBounds);
+        }
+        protected override void OnRenderToolStripBorder(ToolStripRenderEventArgs e)
+        {
+            using (Pen p = new Pen(_palette.Border)) e.Graphics.DrawRectangle(p, 0, 0, e.ToolStrip.Width - 1, e.ToolStrip.Height - 1);
+        }
+        protected override void OnRenderImageMargin(ToolStripRenderEventArgs e) { }
+        protected override void OnRenderItemCheck(ToolStripItemImageRenderEventArgs e) { } // glyphs carry state in the shared gutter
+        protected override void OnRenderItemImage(ToolStripItemImageRenderEventArgs e)
+        {
+            // The stock professional renderer paints Checked items with fixed system colours, which made the
+            // light glyph vanish on the dark menu. Draw an "on" chip from the palette instead.
+            ToolStripMenuItem mi = e.Item as ToolStripMenuItem;
+            if (mi != null && mi.Checked)
+            {
+                Rectangle chip = Rectangle.Inflate(e.ImageRectangle, 3, 3);
+                using (Brush b = new SolidBrush(_palette.Selection)) e.Graphics.FillRectangle(b, chip);
+                using (Pen p = new Pen(_palette.Muted)) e.Graphics.DrawRectangle(p, chip.X, chip.Y, chip.Width - 1, chip.Height - 1);
+            }
+            if (e.Image != null) e.Graphics.DrawImage(e.Image, e.ImageRectangle);
+        }
+        protected override void OnRenderMenuItemBackground(ToolStripItemRenderEventArgs e)
+        {
+            if (e.Item.Enabled && e.Item.Selected)
+                using (Brush b = new SolidBrush(_palette.Selection))
+                    e.Graphics.FillRectangle(b, new Rectangle(2, 0, e.Item.Width - 4, e.Item.Height));
+        }
+        protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e)
+        {
+            e.TextColor = e.Item.Enabled ? _palette.Foreground : _palette.Muted;
+            base.OnRenderItemText(e);
+        }
+        protected override void OnRenderSeparator(ToolStripSeparatorRenderEventArgs e)
+        {
+            using (Pen p = new Pen(_palette.Border))
+                e.Graphics.DrawLine(p, 10, e.Item.Height / 2, e.Item.Width - 10, e.Item.Height / 2);
+        }
+    }
+
+    // Use Windows' own background, focus and selection rendering in high contrast. Repaint
+    // monochrome glyphs with HighlightText on selection, so a bitmap cannot disappear there.
+    sealed class PinHighContrastMenuRenderer : ToolStripSystemRenderer
+    {
+        protected override void OnRenderItemCheck(ToolStripItemImageRenderEventArgs e) { }
+        protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e)
+        {
+            Color color = e.Item.Enabled && e.Item.Selected ? SystemColors.HighlightText : SystemColors.MenuText;
+            TextRenderer.DrawText(e.Graphics, e.Text, e.TextFont, e.TextRectangle, color, e.TextFormat);
+        }
+        protected override void OnRenderItemImage(ToolStripItemImageRenderEventArgs e)
+        {
+            string kind = e.Item.Tag as string;
+            if (kind == null) { base.OnRenderItemImage(e); return; }
+            ToolStripMenuItem item = e.Item as ToolStripMenuItem;
+            Color color = e.Item.Selected ? SystemColors.HighlightText : SystemColors.MenuText;
+            using (Bitmap glyph = PinArtwork.MenuGlyph(kind, e.ImageRectangle.Width, color, item != null && item.Checked))
+                e.Graphics.DrawImageUnscaled(glyph, e.ImageRectangle.Location);
+        }
+    }
+
     public class PinWidgetForm : Form
     {
         private readonly System.Windows.Forms.Timer _pollTimer;
@@ -192,6 +408,15 @@ namespace TaskbarPin
         private readonly ContextMenuStrip _contextMenu;
         private readonly ToolStripMenuItem _menuTogglePin;
         private readonly ToolStripMenuItem _menuAutoStart;
+        private readonly ToolStripMenuItem _menuStatus;
+        private readonly ToolStripMenuItem _menuResetPos;
+        private readonly ToolStripMenuItem _menuExit;
+        private readonly Font _menuFont;
+        private readonly float _uiScale;
+        private UiPalette _menuPalette;
+        private UiPalette _taskbarPalette;
+        private bool _resourcesDisposed;
+        private Icon _applicationIcon;
         private readonly string _configPath;
 
         private bool _isPinnedByApp;
@@ -246,25 +471,49 @@ namespace TaskbarPin
             _toolTip.InitialDelay = 200;
             _toolTip.ReshowDelay = 100;
 
+            using (Graphics screen = Graphics.FromHwnd(IntPtr.Zero)) _uiScale = screen.DpiX / 96f;
+            _taskbarPalette = UiPalette.Read(true);
+            _menuFont = (Font)SystemFonts.MenuFont.Clone();
             _contextMenu = new ContextMenuStrip();
-            _menuTogglePin = new ToolStripMenuItem("钉住任务栏 (禁止自动隐藏)", null, OnMenuTogglePin);
-            var menuResetPos = new ToolStripMenuItem("重置小图标位置", null, (s, e) =>
+            _contextMenu.Font = _menuFont;
+            _contextMenu.ShowImageMargin = true;
+            _contextMenu.ShowCheckMargin = false;
+            _contextMenu.ImageScalingSize = new Size(Scale(18), Scale(18));
+            _contextMenu.Padding = new Padding(Scale(4), Scale(6), Scale(4), Scale(6));
+            _menuStatus = new ToolStripMenuItem { Enabled = false, AccessibleRole = AccessibleRole.StaticText };
+            _menuTogglePin = new ToolStripMenuItem("钉住任务栏", null, OnMenuTogglePin) { Tag = "pin" };
+            _menuResetPos = new ToolStripMenuItem("重置图标位置", null, (s, e) =>
             {
                 _offsetFromTrayNotifyLeft = -48;
                 SaveConfig();
                 UpdateWidgetPositionAndVisibility(true);
-            });
-            _menuAutoStart = new ToolStripMenuItem("开机自动启动", null, OnMenuAutoStart)
+            }) { Tag = "reset" };
+            _menuAutoStart = new ToolStripMenuItem("开机启动", null, OnMenuAutoStart)
             {
-                Checked = IsAutoStartEnabled()
+                Checked = IsAutoStartEnabled(), Tag = "start"
             };
-            var menuExit = new ToolStripMenuItem("退出 (恢复任务栏自动隐藏)", null, OnMenuExit);
+            _menuExit = new ToolStripMenuItem("退出并恢复自动隐藏", null, OnMenuExit) { Tag = "exit" };
 
+            _contextMenu.Items.Add(_menuStatus);
+            _contextMenu.Items.Add(new ToolStripSeparator());
             _contextMenu.Items.Add(_menuTogglePin);
-            _contextMenu.Items.Add(menuResetPos);
+            _contextMenu.Items.Add(_menuResetPos);
             _contextMenu.Items.Add(_menuAutoStart);
             _contextMenu.Items.Add(new ToolStripSeparator());
-            _contextMenu.Items.Add(menuExit);
+            _contextMenu.Items.Add(_menuExit);
+            foreach (ToolStripItem item in _contextMenu.Items)
+                if (item is ToolStripMenuItem) item.Padding = new Padding(Scale(6), Scale(7), Scale(12), Scale(7));
+            _contextMenu.Opening += delegate
+            {
+                // The menu may have been closed while Windows Settings or another instance changed state.
+                _isPinnedByApp = !GetTaskbarAutoHide();
+                _menuAutoStart.Checked = IsAutoStartEnabled();
+                RefreshAppearance();
+                UpdateVisualState();
+            };
+            ApplyMenuTheme(UiPalette.Read(false));
+            _applicationIcon = Icon.ExtractAssociatedIcon(typeof(PinWidgetForm).Assembly.Location);
+            Icon = _applicationIcon;
 
             _trayIcon = new NotifyIcon();
             _trayIcon.ContextMenuStrip = _contextMenu;
@@ -362,6 +611,7 @@ namespace TaskbarPin
                         _menuAutoStart.Checked = true;
                     }
                 }
+                UpdateVisualState();
             }
             catch (Exception ex) { CrashLog.Write("Autostart", ex); }
         }
@@ -389,6 +639,8 @@ namespace TaskbarPin
                 return;
             }
             base.WndProc(ref m);
+            if (m.Msg == 0x031A || m.Msg == 0x001A || m.Msg == 0x007E) // theme, settings, display
+                RefreshAppearance();
         }
 
         protected override void OnHandleCreated(EventArgs e)
@@ -484,6 +736,42 @@ namespace TaskbarPin
             }
         }
 
+        private int Scale(int value) { return Math.Max(1, (int)Math.Round(value * _uiScale)); }
+
+        private void ApplyMenuTheme(UiPalette palette)
+        {
+            _menuPalette = palette;
+            _contextMenu.BackColor = palette.Background;
+            _contextMenu.ForeColor = palette.Foreground;
+            _contextMenu.Renderer = palette.HighContrast
+                ? (ToolStripRenderer)new PinHighContrastMenuRenderer()
+                : new PinMenuRenderer(palette);
+            UpdateMenuImages();
+        }
+
+        private void RefreshAppearance()
+        {
+            if (_resourcesDisposed || _trayIcon == null) return;
+            _taskbarPalette = UiPalette.Read(true);
+            ApplyMenuTheme(UiPalette.Read(false));
+            UpdateTrayIconImage();
+            if (IsHandleCreated) RenderLayeredBitmap();
+        }
+
+        private void UpdateMenuImages()
+        {
+            foreach (ToolStripItem item in _contextMenu.Items)
+            {
+                string kind = item.Tag as string;
+                if (kind == null) continue;
+                bool active = kind == "pin" ? _isPinnedByApp : kind == "start" && _menuAutoStart.Checked;
+                Image replacement = PinArtwork.MenuGlyph(kind, Scale(18), _menuPalette.Foreground, active);
+                Image previous = item.Image;
+                item.Image = replacement;
+                if (previous != null) previous.Dispose(); // ToolStripItem does not own assigned Image objects.
+            }
+        }
+
         private void OnMenuTogglePin(object sender, EventArgs e)
         {
             TogglePinState();
@@ -499,8 +787,7 @@ namespace TaskbarPin
                 TriggerNativeTaskbarCollapse(_lastNonTrayForeground, true);
             }
             _trayIcon.Visible = false;
-            _trayIcon.Dispose();
-            ReleaseTrayIconHandle();
+            Close(); // The form's Dispose method owns all icon/image resources.
             Application.Exit();
         }
 
@@ -850,16 +1137,15 @@ namespace TaskbarPin
         private void UpdateVisualState()
         {
             string tip = _isPinnedByApp
-                ? "任务栏已钉住（不会自动隐藏）\n左键点击：取消钉住，恢复自动隐藏\n按住左键拖动：调整水平位置"
-                : "任务栏未钉住（自动隐藏已开启）\n左键点击：钉住任务栏" ;
+                ? "任务栏已钉住 · 保持显示\n单击：恢复自动隐藏\n拖动：调整图标位置"
+                : "任务栏自动隐藏\n单击：钉住任务栏\n拖动：调整图标位置";
 
-            if (_toolTip != null)
-            {
-                _toolTip.SetToolTip(this, tip);
-            }
-
+            if (_toolTip != null) _toolTip.SetToolTip(this, tip);
+            _menuStatus.Text = _isPinnedByApp ? "已钉住 · 任务栏保持显示" : "自动隐藏 · 随系统收起";
             _menuTogglePin.Checked = _isPinnedByApp;
-            _menuTogglePin.Text = _isPinnedByApp ? "取消钉住（恢复任务栏自动隐藏）" : "钉住任务栏（禁止自动隐藏）";
+            _menuTogglePin.Text = _isPinnedByApp ? "恢复自动隐藏" : "钉住任务栏";
+            _menuAutoStart.Text = _menuAutoStart.Checked ? "开机启动（已开启）" : "开机启动";
+            UpdateMenuImages();
 
             _trayIcon.Text = _isPinnedByApp ? "任务栏钉子：已钉住 (点击释放)" : "任务栏钉子：自动隐藏中 (点击钉住)";
             UpdateTrayIconImage();
@@ -872,31 +1158,32 @@ namespace TaskbarPin
 
         private void UpdateTrayIconImage()
         {
-            using (Bitmap bmp = new Bitmap(32, 32, System.Drawing.Imaging.PixelFormat.Format32bppArgb))
+            int size = Scale(16); // Draw at the actual tray size, rather than letting Explorer shrink 32px.
+            using (Bitmap bmp = new Bitmap(size, size, System.Drawing.Imaging.PixelFormat.Format32bppArgb))
             {
                 using (Graphics g = Graphics.FromImage(bmp))
+                    PinArtwork.DrawBadge(g, size, _isPinnedByApp, false, _taskbarPalette);
+
+                // FromHandle borrows the HICON. Transfer the pair only after NotifyIcon accepts it;
+                // on failure the old icon stays valid and the newly allocated handle is reclaimed.
+                IntPtr handle = bmp.GetHicon();
+                Icon replacement = null;
+                try
                 {
-                    DrawPinBadge(g, 32, _isPinnedByApp, false);
+                    replacement = Icon.FromHandle(handle);
+                    Icon previous = _trayIcon.Icon;
+                    IntPtr previousHandle = _trayIconHandle;
+                    _trayIcon.Icon = replacement;
+                    _trayIconHandle = handle;
+                    handle = IntPtr.Zero;
+                    replacement = null;
+                    if (previous != null) previous.Dispose();
+                    if (previousHandle != IntPtr.Zero) Win32.DestroyIcon(previousHandle);
                 }
-
-                // Icon.FromHandle() wraps an HICON without taking ownership, so disposing the Icon
-                // does not free the native handle: that used to leak 1 USER + 3 GDI handles per
-                // call (~3300 status refreshes would exhaust the 10000 GDI handle limit). Keep the
-                // HICON and DestroyIcon() the one we replace.
-                Icon previousIcon = _trayIcon.Icon;
-                IntPtr previousHandle = _trayIconHandle;
-
-                IntPtr hIcon = bmp.GetHicon();
-                _trayIcon.Icon = Icon.FromHandle(hIcon);
-                _trayIconHandle = hIcon;
-
-                if (previousIcon != null)
+                finally
                 {
-                    previousIcon.Dispose();
-                }
-                if (previousHandle != IntPtr.Zero)
-                {
-                    Win32.DestroyIcon(previousHandle);
+                    if (replacement != null) replacement.Dispose();
+                    if (handle != IntPtr.Zero) Win32.DestroyIcon(handle);
                 }
             }
         }
@@ -905,16 +1192,20 @@ namespace TaskbarPin
         {
             IntPtr handle = _trayIconHandle;
             _trayIconHandle = IntPtr.Zero;
-            if (handle != IntPtr.Zero)
+            if (_trayIcon != null)
             {
-                Win32.DestroyIcon(handle);
+                Icon image = _trayIcon.Icon;
+                _trayIcon.Icon = null;
+                if (image != null) image.Dispose();
             }
+            if (handle != IntPtr.Zero) Win32.DestroyIcon(handle);
         }
 
         protected override void Dispose(bool disposing)
         {
-            if (disposing)
+            if (disposing && !_resourcesDisposed)
             {
+                _resourcesDisposed = true;
                 if (_pollTimer != null)
                 {
                     _pollTimer.Stop();
@@ -923,11 +1214,23 @@ namespace TaskbarPin
                 if (_trayIcon != null)
                 {
                     _trayIcon.Visible = false;
+                    ReleaseTrayIconHandle();
                     _trayIcon.Dispose();
                 }
-                if (_contextMenu != null) _contextMenu.Dispose();
+                if (_contextMenu != null)
+                {
+                    foreach (ToolStripItem item in _contextMenu.Items)
+                    {
+                        Image image = item.Image;
+                        item.Image = null;
+                        if (image != null) image.Dispose();
+                    }
+                    _contextMenu.Dispose();
+                }
+                if (_menuFont != null) _menuFont.Dispose();
                 if (_toolTip != null) _toolTip.Dispose();
-                ReleaseTrayIconHandle();
+                Icon = null;
+                if (_applicationIcon != null) { _applicationIcon.Dispose(); _applicationIcon = null; }
             }
             base.Dispose(disposing);
         }
@@ -959,7 +1262,7 @@ namespace TaskbarPin
             {
                 using (Graphics g = Graphics.FromImage(bmp))
                 {
-                    DrawPinBadge(g, _widgetSize, _isPinnedByApp, _isHovered);
+                    PinArtwork.DrawBadge(g, _widgetSize, _isPinnedByApp, _isHovered, _taskbarPalette);
                 }
 
                 IntPtr screenDc = Win32.GetDC(IntPtr.Zero);
@@ -1002,114 +1305,10 @@ namespace TaskbarPin
             }
         }
 
+        // Kept as a stable entry point for the reflection tests; all artwork lives in PinArtwork.
         private static void DrawPinBadge(Graphics g, int size, bool isPinned, bool isHovered)
         {
-            g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-            g.Clear(Color.Transparent);
-
-            float pad = 2.5f;
-            RectangleF badgeRect = new RectangleF(pad, pad, size - pad * 2, size - pad * 2);
-
-            using (GraphicsPath badgePath = CreateRoundedRect(badgeRect, 10f))
-            {
-                if (isPinned)
-                {
-                    Color c1 = isHovered ? Color.FromArgb(245, 59, 130, 246) : Color.FromArgb(235, 37, 99, 235);
-                    Color c2 = isHovered ? Color.FromArgb(245, 29, 78, 216) : Color.FromArgb(235, 30, 64, 175);
-                    using (LinearGradientBrush bg = new LinearGradientBrush(badgeRect, c1, c2, 45f))
-                    {
-                        g.FillPath(bg, badgePath);
-                    }
-                    using (Pen borderPen = new Pen(Color.FromArgb(200, 147, 197, 253), 1.3f))
-                    {
-                        g.DrawPath(borderPen, badgePath);
-                    }
-                }
-                else
-                {
-                    Color c1 = isHovered ? Color.FromArgb(230, 255, 255, 255) : Color.FromArgb(190, 248, 250, 252);
-                    Color c2 = isHovered ? Color.FromArgb(230, 226, 232, 240) : Color.FromArgb(190, 203, 213, 225);
-                    using (LinearGradientBrush bg = new LinearGradientBrush(badgeRect, c1, c2, 45f))
-                    {
-                        g.FillPath(bg, badgePath);
-                    }
-                    using (Pen borderPen = new Pen(Color.FromArgb(160, 100, 116, 139), 1.2f))
-                    {
-                        g.DrawPath(borderPen, badgePath);
-                    }
-                }
-            }
-
-            GraphicsState state = g.Save();
-            g.TranslateTransform(size / 2f, size / 2f);
-            if (!isPinned)
-            {
-                g.RotateTransform(38f);
-            }
-            float s = size / 38f;
-            g.ScaleTransform(s, s);
-
-            Color pinMain = isPinned ? Color.White : Color.FromArgb(230, 51, 65, 85);
-            Color pinShade = isPinned ? Color.FromArgb(220, 219, 234, 254) : Color.FromArgb(230, 100, 116, 139);
-
-            using (SolidBrush bMain = new SolidBrush(pinMain))
-            using (SolidBrush bShade = new SolidBrush(pinShade))
-            using (Pen needlePen = new Pen(pinMain, 2.2f))
-            {
-                needlePen.StartCap = LineCap.Round;
-                needlePen.EndCap = LineCap.Triangle;
-
-                using (GraphicsPath headPath = CreateRoundedRect(new RectangleF(-6.5f, -11f, 13f, 3.6f), 1.8f))
-                {
-                    g.FillPath(bMain, headPath);
-                }
-
-                PointF[] bodyPts = new PointF[]
-                {
-                    new PointF(-4.2f, -7.4f),
-                    new PointF(4.2f, -7.4f),
-                    new PointF(5.5f, -0.5f),
-                    new PointF(-5.5f, -0.5f)
-                };
-                g.FillPolygon(bShade, bodyPts);
-
-                using (GraphicsPath flangePath = CreateRoundedRect(new RectangleF(-8.0f, -1.2f, 16.0f, 3.4f), 1.7f))
-                {
-                    g.FillPath(bMain, flangePath);
-                }
-
-                g.DrawLine(needlePen, 0f, 2.2f, 0f, 11.2f);
-            }
-
-            g.Restore(state);
-
-            if (isPinned)
-            {
-                using (SolidBrush dotBrush = new SolidBrush(Color.FromArgb(255, 74, 222, 128)))
-                using (Pen dotRing = new Pen(Color.FromArgb(220, 20, 83, 45), 1f))
-                {
-                    g.FillEllipse(dotBrush, size - 10.5f, size - 10.5f, 6.5f, 6.5f);
-                    g.DrawEllipse(dotRing, size - 10.5f, size - 10.5f, 6.5f, 6.5f);
-                }
-            }
-        }
-
-        private static GraphicsPath CreateRoundedRect(RectangleF bounds, float radius)
-        {
-            float d = radius * 2f;
-            GraphicsPath path = new GraphicsPath();
-            if (radius <= 0f)
-            {
-                path.AddRectangle(bounds);
-                return path;
-            }
-            path.AddArc(bounds.Left, bounds.Top, d, d, 180, 90);
-            path.AddArc(bounds.Right - d, bounds.Top, d, d, 270, 90);
-            path.AddArc(bounds.Right - d, bounds.Bottom - d, d, d, 0, 90);
-            path.AddArc(bounds.Left, bounds.Bottom - d, d, d, 90, 90);
-            path.CloseFigure();
-            return path;
+            PinArtwork.DrawBadge(g, size, isPinned, isHovered, UiPalette.Read(true));
         }
     }
 
