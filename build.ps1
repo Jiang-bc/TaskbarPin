@@ -5,12 +5,14 @@
 .DESCRIPTION
   1. Compiles tools\IconAssetBuilder.cs with src\TaskbarPin.cs and regenerates assets\TaskbarPin.ico/.png.
   2. Compiles src\TaskbarPin.cs with /win32icon, so Explorer, shortcuts and Alt-Tab show the app icon.
+  3. With -Test, runs the regression suites on a temporary copy of the build.
   Output defaults to bin\TaskbarPin.exe. No SDK, NuGet package or network access is used.
 #>
 [CmdletBinding()]
 param(
     [string]$Output,
-    [switch]$SkipAssets
+    [switch]$SkipAssets,
+    [switch]$Test
 )
 $ErrorActionPreference = 'Stop'
 $Root = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
@@ -37,7 +39,7 @@ $refs = @('/r:System.dll', '/r:System.Drawing.dll', '/r:System.Windows.Forms.dll
 if (-not $SkipAssets) {
     $tool = Join-Path ([IO.Path]::GetTempPath()) ("TaskbarPinIconBuilder-" + [Guid]::NewGuid().ToString('N') + '.exe')
     try {
-        & $csc /nologo /optimize+ /target:exe /main:IconAssetBuilder "/out:$tool" @refs $builder $source
+        & $csc /nologo /langversion:5 /optimize+ /target:exe /main:IconAssetBuilder "/out:$tool" @refs $builder $source
         if ($LASTEXITCODE -ne 0) { throw "Icon generator build failed ($LASTEXITCODE)." }
         & $tool $ico $png
         if ($LASTEXITCODE -ne 0) { throw "Icon generation failed ($LASTEXITCODE)." }
@@ -46,7 +48,32 @@ if (-not $SkipAssets) {
 }
 if (-not (Test-Path -LiteralPath $ico)) { throw "Missing $ico; run without -SkipAssets." }
 
-& $csc /nologo /optimize+ /target:winexe "/win32icon:$ico" "/out:$Output" @refs $source
+& $csc /nologo /langversion:5 /optimize+ /target:winexe "/win32icon:$ico" "/out:$Output" @refs $source
 if ($LASTEXITCODE -ne 0) { throw "TaskbarPin build failed ($LASTEXITCODE)." }
 Write-Host "Built $Output"
+
+if ($Test) {
+    $testParent = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
+    $testRoot = Join-Path $testParent ("TaskbarPinTests-" + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $testRoot | Out-Null
+    try {
+        $testApp = Join-Path $testRoot 'TaskbarPin.exe'
+        Copy-Item -LiteralPath $Output -Destination $testApp
+        $testAccess = Join-Path $Root 'tests\TestAccess.cs'
+        foreach ($suite in 'Tests', 'UiTests', 'RobustnessTests', 'RepairTests') {
+            $testExe = Join-Path $testRoot "$suite.exe"
+            $testSource = Join-Path $Root "tests\$suite.cs"
+            & $csc /nologo /langversion:5 /optimize+ /target:exe "/out:$testExe" @refs $testSource $testAccess
+            if ($LASTEXITCODE -ne 0) { throw "$suite build failed ($LASTEXITCODE)." }
+            & $testExe $testApp
+            if ($LASTEXITCODE -ne 0) { throw "$suite failed ($LASTEXITCODE)." }
+        }
+    }
+    finally {
+        $resolved = (Resolve-Path -LiteralPath $testRoot).ProviderPath
+        if ($resolved -eq $testRoot -and (Split-Path -Parent $resolved) -eq $testParent.TrimEnd('\')) {
+            Remove-Item -LiteralPath $resolved -Recurse -Force
+        }
+    }
+}
 

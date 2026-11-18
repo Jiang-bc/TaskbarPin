@@ -4,17 +4,24 @@
 
 ## 功能
 
-- 点击钉子：在“钉住任务栏（禁止自动隐藏）”与“恢复自动隐藏”之间切换
-- 钉子与任务栏同层级：钉子作为 `Shell_TrayWnd` 的子窗口，全屏应用遮住任务栏时钉子一起被遮住
-- 取消钉住时钉子随任务栏一起滑落，不提前消失
-- 按住左键拖动可调整水平位置（位置存入 `config.ini`）
-- 右键菜单：钉住/取消、重置位置、开机自启、退出（退出时恢复自动隐藏）
-- 系统托盘也有一个小图标，左键同样可切换
+- 单击系统托盘钉子，在“钉住任务栏（禁止自动隐藏）”与“恢复自动隐藏”之间切换。
+- 右键菜单提供钉住/恢复、开机自启和退出；退出时恢复自动隐藏。
+- Explorer 重建任务栏后，程序重新显示托盘图标并同步状态。
 
 ## 运行环境
 
-- Windows 10 / 11（分层子窗口需 Windows 8+）
+- Windows 10 / 11
 - .NET Framework 4.x（系统自带，无需安装）
+
+应用仅控制主任务栏 `Shell_TrayWnd`；收起方向按系统报告的停靠位置计算。程序采用系统 DPI 感知，显示设置变化后重新读取系统提供的缩放比例。Windows 11 的新托盘图标可能位于 `^` 溢出区，可手动将其拖到常驻区。
+
+历史交互实测覆盖 Windows 11 24H2，本轮回归运行于 Windows 11（Build 26300）。混合 DPI、多显示器与 Windows 10 顶部或侧边任务栏仍需实机验证。
+
+## 配置与诊断
+
+`debug.log` 默认位于程序目录；程序目录不可写或日志文件只读时，改用 `%LOCALAPPDATA%\TaskbarPin\`。旧版本留下的 `config.ini` 不再读取。
+
+日志每分钟最多写入一次同类错误，当前日志达到 256 KiB 后轮转到 `debug.log.1`。
 
 ## 编译
 
@@ -40,21 +47,20 @@ powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1 -SkipAssets   # �
 | --- | --- |
 | ![浅色菜单](docs/images/menu-light.png) | ![深色菜单](docs/images/menu-dark.png) |
 
-菜单支持方向键、Enter 和 Esc；菜单打开后可用 P 切换钉住、R 重置位置、S 切换开机启动、X 退出。
+菜单支持方向键、Enter 和 Esc；菜单打开后可用 P 切换钉住、S 切换开机启动、X 退出。
 
-- `assets/TaskbarPin.ico`（16–256px，9 档，32 位 ARGB）与 `assets/TaskbarPin.png` 由 `tools/IconAssetBuilder.cs` 用与运行时托盘/任务栏徽标相同的矢量几何绘制，不是位图缩放；`build.ps1` 会重新生成。
+- `assets/TaskbarPin.ico`（16–256px，9 档，32 位 ARGB）与 `assets/TaskbarPin.png` 由 `tools/IconAssetBuilder.cs` 用与运行时托盘徽标相同的矢量几何绘制，不是位图缩放；`build.ps1` 会重新生成。
 - 右键菜单：顶部为状态行（已钉住 / 自动隐藏），统一图标列，菜单字体与间距遵循系统菜单字体和 DPI。
-- 主题：任务栏徽标跟随“系统（任务栏）”主题，菜单跟随“应用”主题，二者独立读取；高对比度模式改用系统颜色，并保留图标形状区分状态。
+- 主题：托盘徽标跟随“系统（任务栏）”主题，菜单跟随“应用”主题，二者独立读取；高对比度模式改用系统颜色，并保留图标形状区分状态。
 - 检查界面：`tests\Render.cs` 把真实菜单与全部图标尺寸渲染为 PNG（浅色/深色/高对比度），渲染时注入调色板，不修改任何系统设置。
 
 ## 测试
 
-```bat
-csc /nologo /optimize+ /r:System.Windows.Forms.dll /r:System.Drawing.dll /out:UiTests.exe tests\UiTests.cs
-UiTests.exe bin\TaskbarPin.exe
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1 -Test
 ```
 
-`tests\Tests.cs`（反射回归测试）与 `tests\UiTests.cs`（图标资源、菜单布局、对比度、句柄泄漏）均不写注册表，也不改变系统主题；涉及任务栏自动隐藏的用例会在结束时恢复原状态。
+测试需要运行着 Explorer 的交互式 Windows 桌面。脚本通过临时目录中的构建副本运行 `Tests`、`UiTests`、`RobustnessTests` 和 `RepairTests`，测试结束时恢复自动隐藏设置和光标位置。自启动回归使用独立临时注册表键；托盘重建通过系统消息模拟。
 
 ## 使用
 
@@ -63,10 +69,12 @@ UiTests.exe bin\TaskbarPin.exe
 - `TaskbarPin.exe --pin`：钉住任务栏
 - `TaskbarPin.exe --unpin`：恢复自动隐藏并立即收起
 
+参数忽略大小写。无效参数返回退出码 `2`，用法写入诊断日志。系统启动项指向旧路径时，点击开机启动菜单会登记当前路径。
+
 ## 实现要点
 
 - `SHAppBarMessage(ABM_SETSTATE)` 切换 `ABS_AUTOHIDE` / `ABS_ALWAYSONTOP`
-- 钉子为 `WS_EX_LAYERED` 窗口，用 `UpdateLayeredWindow` 绘制与移动（屏幕坐标）
-- `SetParent` 挂入任务栏，继承其 Z 序与遮盖关系
-- 16ms 轮询任务栏矩形，钉子位置跟随任务栏动画
-- 取消钉住时通过“触碰-移开”鼠标序列与焦点脉冲触发资源管理器原生收起动画
+- 不可见窗体作为消息宿主，由独立 `ApplicationContext` 管理，界面只有 `NotifyIcon`。
+- 收到 `TaskbarCreated` 广播时清空任务栏缓存，重新同步状态并显示托盘图标。
+- 空闲时每 50 ms 轮询，其中自动隐藏状态每 500 ms 查询一次；仅在收起期间以 16 ms 查询任务栏几何。
+- 取消钉住时通过“触碰-移开”鼠标序列与焦点脉冲触发资源管理器原生收起动画。全屏前台跳过焦点脉冲，收起等待最多持续约 1.1 秒。

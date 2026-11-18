@@ -13,7 +13,7 @@ static class UiTests
     static Assembly assembly;
     static Type formType;
     static int passed, failed;
-    const BindingFlags Members = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static;
+    const BindingFlags Members = TestAccess.Members;
     [DllImport("shell32.dll", CharSet = CharSet.Unicode)] static extern uint ExtractIconEx(string file, int index, IntPtr[] large, IntPtr[] small, uint count);
     [DllImport("user32.dll")] static extern uint GetGuiResources(IntPtr process, uint flags);
     [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
@@ -24,21 +24,16 @@ static class UiTests
         Console.WriteLine((condition ? "PASS " : "FAIL ") + name);
         if (condition) passed++; else failed++;
     }
-    static object Field(object instance, string name)
-    {
-        FieldInfo field = instance.GetType().GetField(name, Members);
-        return field == null ? null : field.GetValue(instance);
-    }
-    static void Set(object instance, string name, object value) { instance.GetType().GetField(name, Members).SetValue(instance, value); }
+    static object Field(object instance, string name) { return TestAccess.Get(instance, name); }
+    static void Set(object instance, string name, object value) { TestAccess.Set(instance, name, value); }
     static object Call(object instance, string name, params object[] args)
     {
-        return instance.GetType().GetMethod(name, Members).Invoke(instance, args);
+        return TestAccess.Call(instance, name, args);
     }
     static Form NewForm()
     {
         Form form = (Form)Activator.CreateInstance(formType, true);
-        ((Timer)Field(form, "_pollTimer")).Stop();
-        ((NotifyIcon)Field(form, "_trayIcon")).Visible = false;
+        TestAccess.Quiet(form);
         form.Hide();
         return form;
     }
@@ -58,7 +53,11 @@ static class UiTests
             int actions = 0, illustrated = 0;
             foreach (ToolStripItem item in menu.Items)
                 if (item is ToolStripMenuItem && item.Enabled) { actions++; if (item.Image != null) illustrated++; }
-            Check("all four commands have glyphs", actions == 4 && illustrated == 4);
+            Check("all three commands have glyphs", actions == 3 && illustrated == 3);
+            Check("menu contains six items", menu.Items.Count == 6);
+            bool hasReset = false;
+            foreach (ToolStripItem item in menu.Items) if (item.Text.Contains("重置图标位置")) hasReset = true;
+            Check("menu does not offer a position reset", !hasReset);
             Check("menu has a single shared icon gutter", menu.ShowImageMargin && !menu.ShowCheckMargin);
             foreach (ToolStripItem item in menu.Items)
                 if (item is ToolStripMenuItem && item.Enabled)
@@ -120,7 +119,7 @@ static class UiTests
         SetProcessDPIAware();
         Application.EnableVisualStyles();
         assembly = Assembly.LoadFrom(Path.GetFullPath(args[0]));
-        formType = assembly.GetType("TaskbarPin.PinWidgetForm", true);
+        formType = assembly.GetType(TestAccess.FormTypeName, true);
         Check("EXE includes a Windows icon resource", ExtractIconEx(Path.GetFullPath(args[0]), -1, null, null, 0) > 0);
         TestMenu();
         TestThemes();

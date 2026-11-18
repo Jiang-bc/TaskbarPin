@@ -22,7 +22,7 @@ static class Render
         string exe = Path.GetFullPath(args[0]), outDir = Path.GetFullPath(args[1]);
         Directory.CreateDirectory(outDir);
         asm = Assembly.LoadFrom(exe);
-        Type formType = asm.GetType("TaskbarPin.PinWidgetForm");
+        Type formType = asm.GetType("TaskbarPin.PinTrayForm");
         Type art = asm.GetType("TaskbarPin.PinArtwork");
 
         string[] names = { "light", "dark", "hc" };

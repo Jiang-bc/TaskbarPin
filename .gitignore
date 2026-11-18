@@ -4,4 +4,5 @@ obj/
 *.pdb
 config.ini
 debug.log
+debug.log.1
 .vs/
